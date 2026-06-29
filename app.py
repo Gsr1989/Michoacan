@@ -9,37 +9,48 @@ from contextlib import asynccontextmanager, suppress
 from starlette.middleware.sessions import SessionMiddleware
 import asyncio
 import random
+from io import BytesIO
+import qrcode
+import fitz
+from aiogram import Bot, Dispatcher, types
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.filters import Command
+from aiogram.types import FSInputFile, ContentType, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+import aiohttp
 
 # ===================== CONFIG =====================
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-BASE_URL     = os.getenv("BASE_URL", "https://https-michoacan-gob-mx-tramites-permiso.onrender.com").rstrip("/")
-ENTIDAD      = "michoacan"
-TZ           = "America/Mexico_City"
-
-ADMIN_USER = "Serg890105tm3"
-ADMIN_PASS = "Serg890105tm3"
-
+SUPABASE_URL  = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY  = os.getenv("SUPABASE_KEY", "")
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
+BASE_URL      = os.getenv("BASE_URL", "https://https-michoacan-gob-mx-tramites-permiso.onrender.com").rstrip("/")
+ENTIDAD       = "michoacan"
+TZ            = "America/Mexico_City"
+ADMIN_USER    = "Serg890105tm3"
+ADMIN_PASS    = "Serg890105tm3"
 STATIC_DIR    = "static"
-BUCKET_NAME   = "permisos-michoacan"
 OUTPUT_DIR    = "documentos"
+BUCKET_NAME   = "permisos-michoacan"
 PLANTILLA_PDF = "michoacan_permiso.pdf"
-
 FOLIO_PREFIJO  = "MCH"
 FOLIO_NUM_PREF = "620"
 _folio_counter = {"siguiente": 1}
 _folio_lock    = asyncio.Lock()
+PAGE_SIZE = 100
+C1 = "#4a001f"
+C2 = "#3a0018"
+C3 = "#6A0F49"
 
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-C1 = "#4a001f"
-C2 = "#3a0018"
-C3 = "#6A0F49"
-
-PAGE_SIZE = 100
+_bot_session = AiohttpSession(timeout=aiohttp.ClientTimeout(total=300))
+bot     = Bot(token=BOT_TOKEN, session=_bot_session)
+storage = MemoryStorage()
+dp      = Dispatcher(storage=storage)
 
 TABLAS_DISPONIBLES = {
     "folios_registrados": {
@@ -57,6 +68,81 @@ TABLAS_DISPONIBLES = {
     },
 }
 
+# ===================== TIMERS =====================
+timers_activos       = {}
+user_folios          = {}
+pending_comprobantes = {}
+TOTAL_MINUTOS_TIMER  = 36 * 60
+
+async def eliminar_folio_automatico(folio: str):
+    try:
+        uid = timers_activos[folio]["user_id"] if folio in timers_activos else None
+        await asyncio.to_thread(lambda: supabase.table("folios_registrados").delete().eq("folio", folio).execute())
+        try:
+            await asyncio.to_thread(lambda: supabase.storage.from_(BUCKET_NAME).remove([f"{folio}.pdf"]))
+        except Exception as e: print(f"[STORAGE] Error borrando {folio}.pdf: {e}")
+        ruta_local = os.path.join(OUTPUT_DIR, f"{folio}.pdf")
+        if os.path.exists(ruta_local): os.remove(ruta_local)
+        if uid:
+            await bot.send_message(uid,
+                f"⏰ TIEMPO AGOTADO - MICHOACÁN\n\nEl folio {folio} fue eliminado por no completar el pago en 36 horas.\n\n📋 Use /michoacan para generar otro permiso.")
+        limpiar_timer_folio(folio)
+    except Exception as e: print(f"[ERROR] eliminando folio {folio}: {e}")
+
+async def enviar_recordatorio(folio: str, minutos_restantes: int):
+    try:
+        if folio not in timers_activos: return
+        uid = timers_activos[folio]["user_id"]
+        await bot.send_message(uid,
+            f"⚡ RECORDATORIO - MICHOACÁN\n\nFolio: {folio}\nTiempo restante: {minutos_restantes} minutos\n\n📸 Envíe su comprobante de pago.\n\n📋 Use /michoacan para otro permiso.")
+    except Exception as e: print(f"[ERROR] recordatorio {folio}: {e}")
+
+async def iniciar_timer_36h(user_id: int, folio: str, nombre: str = ""):
+    async def timer_task():
+        print(f"[TIMER] Iniciado folio {folio} (36h)")
+        await asyncio.sleep(34.5 * 3600)
+        if folio not in timers_activos: return
+        await enviar_recordatorio(folio, 90)
+        await asyncio.sleep(30 * 60)
+        if folio not in timers_activos: return
+        await enviar_recordatorio(folio, 60)
+        await asyncio.sleep(30 * 60)
+        if folio not in timers_activos: return
+        await enviar_recordatorio(folio, 30)
+        await asyncio.sleep(20 * 60)
+        if folio not in timers_activos: return
+        await enviar_recordatorio(folio, 10)
+        await asyncio.sleep(10 * 60)
+        if folio in timers_activos:
+            print(f"[TIMER] Expirado {folio} — eliminando")
+            await eliminar_folio_automatico(folio)
+    task = asyncio.create_task(timer_task())
+    timers_activos[folio] = {"task": task, "user_id": user_id, "start_time": datetime.now(), "nombre": nombre}
+    user_folios.setdefault(user_id, []).append(folio)
+    print(f"[SISTEMA] Timer 36h iniciado folio {folio} ({nombre})")
+
+def cancelar_timer_folio(folio: str) -> bool:
+    if folio not in timers_activos: return False
+    timers_activos[folio]["task"].cancel()
+    uid = timers_activos[folio]["user_id"]
+    del timers_activos[folio]
+    if uid in user_folios and folio in user_folios[uid]:
+        user_folios[uid].remove(folio)
+        if not user_folios[uid]: del user_folios[uid]
+    print(f"[SISTEMA] Timer cancelado folio {folio}")
+    return True
+
+def limpiar_timer_folio(folio: str):
+    if folio not in timers_activos: return
+    uid = timers_activos[folio]["user_id"]
+    del timers_activos[folio]
+    if uid in user_folios and folio in user_folios[uid]:
+        user_folios[uid].remove(folio)
+        if not user_folios[uid]: del user_folios[uid]
+
+def obtener_folios_usuario(user_id: int) -> list:
+    return user_folios.get(user_id, [])
+
 # ===================== FOLIOS =====================
 def _sb_leer_watermark():
     try:
@@ -65,15 +151,13 @@ def _sb_leer_watermark():
     except: return None
 
 def _sb_guardar_watermark(numero):
-    try:
-        supabase.table("folio_watermark").upsert({"prefijo": FOLIO_PREFIJO, "ultimo_asignado": numero}).execute()
+    try: supabase.table("folio_watermark").upsert({"prefijo": FOLIO_PREFIJO, "ultimo_asignado": numero}).execute()
     except Exception as e: print(f"[ERROR] guardar_watermark: {e}")
 
 def _sb_inicializar_folio():
     wm = _sb_leer_watermark()
     if wm is not None:
-        _folio_counter["siguiente"] = wm + 1
-        print(f"[FOLIO] Desde watermark: siguiente={_folio_counter['siguiente']}"); return
+        _folio_counter["siguiente"] = wm + 1; return
     try:
         resp = supabase.table("folios_registrados").select("folio").eq("entidad", ENTIDAD).like("folio", f"{FOLIO_NUM_PREF}%").execute()
         nums = []
@@ -84,8 +168,7 @@ def _sb_inicializar_folio():
                 if suf.isdigit(): nums.append(int(suf))
         if nums:
             maximo = max(nums); _folio_counter["siguiente"] = maximo + 1; _sb_guardar_watermark(maximo)
-        else:
-            _folio_counter["siguiente"] = 1
+        else: _folio_counter["siguiente"] = 1
     except Exception as e: print(f"[ERROR] inicializar_folio: {e}")
 
 def _folio_existe(folio):
@@ -105,9 +188,306 @@ def _generar_folio_sync():
         candidato += 1
     return f"{FOLIO_NUM_PREF}{random.randint(50000,99999)}"
 
+async def _generar_folio_async():
+    async with _folio_lock:
+        return await asyncio.to_thread(_generar_folio_sync)
+
 def generar_folio(): return _generar_folio_sync()
 
-# ===================== HTML BASE =====================
+# ===================== STORAGE =====================
+def subir_pdf_a_storage(ruta_local: str, folio: str) -> str:
+    try:
+        if not os.path.exists(ruta_local): return ""
+        with open(ruta_local, "rb") as f: contenido = f.read()
+        nombre = f"{folio}.pdf"
+        supabase.storage.from_(BUCKET_NAME).upload(path=nombre, file=contenido,
+            file_options={"content-type": "application/pdf", "upsert": "true"})
+        url = supabase.storage.from_(BUCKET_NAME).get_public_url(nombre)
+        print(f"[STORAGE] ✅ Subido: {url}"); return url
+    except Exception as e:
+        print(f"[STORAGE] ❌ Error {folio}: {e}"); return ""
+
+# ===================== QR / PDF =====================
+def generar_qr(folio: str):
+    try:
+        url = f"{BASE_URL}/consulta/{folio}"
+        qr  = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=4, border=1)
+        qr.add_data(url); qr.make(fit=True)
+        return qr.make_image(fill_color="black", back_color="white").convert("RGB"), url
+    except Exception as e:
+        print(f"[QR] Error: {e}"); return None, None
+
+def generar_pdf(datos: dict) -> str:
+    folio = datos["folio"]; out = os.path.join(OUTPUT_DIR, f"{folio}.pdf")
+    tz = ZoneInfo(TZ)
+    try:
+        fecha_dt = datos["fecha_exp_dt"]
+        if isinstance(fecha_dt, str): fecha_dt = datetime.fromisoformat(fecha_dt.replace("Z", "+00:00"))
+        if fecha_dt.tzinfo is None: fecha_dt = fecha_dt.replace(tzinfo=tz)
+        else: fecha_dt = fecha_dt.astimezone(tz)
+    except: fecha_dt = datetime.now(tz)
+    meses = {1:"ENERO",2:"FEBRERO",3:"MARZO",4:"ABRIL",5:"MAYO",6:"JUNIO",
+             7:"JULIO",8:"AGOSTO",9:"SEPTIEMBRE",10:"OCTUBRE",11:"NOVIEMBRE",12:"DICIEMBRE"}
+    dia = str(fecha_dt.day); mes = meses[fecha_dt.month]; anio = str(fecha_dt.year)
+    try:
+        if os.path.exists(PLANTILLA_PDF):
+            doc = fitz.open(PLANTILLA_PDF); pg = doc[0]
+            pg.insert_text((500, 97),  str(folio),                          fontsize=13, fontname="hebo", color=(0.55,0.06,0.12))
+            pg.insert_text((169, 123), dia,                                  fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((228, 123), mes,                                  fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((346, 123), anio,                                 fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((84,  188), str(datos.get("nombre","")).upper(),  fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((268, 239), str(datos.get("marca","")).upper(),   fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((240, 252), str(datos.get("linea","")).upper(),   fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((240, 265), str(datos.get("color","")).upper(),   fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((240, 278), str(datos.get("anio","")),            fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((260, 290), str(datos.get("serie","")).upper(),   fontsize=10, fontname="helv", color=(0,0,0))
+            img_qr, _ = generar_qr(folio)
+            if img_qr:
+                buf = BytesIO(); img_qr.save(buf, format="PNG"); buf.seek(0)
+                pg.insert_image(fitz.Rect(160, 300, 235, 375), pixmap=fitz.Pixmap(buf.read()), overlay=True)
+        else:
+            doc = fitz.open(); pg = doc.new_page(width=612, height=792)
+            pg.insert_text((50,60),  "GOBIERNO DEL ESTADO DE MICHOACÁN",        fontsize=13, fontname="hebo", color=(0.29,0,0.12))
+            pg.insert_text((50,76),  "SECRETARÍA DE SEGURIDAD PÚBLICA",          fontsize=11, fontname="helv", color=(0,0,0))
+            pg.insert_text((50,91),  "DIRECCIÓN DE TRÁNSITO ESTATAL",            fontsize=11, fontname="helv", color=(0,0,0))
+            pg.draw_rect(fitz.Rect(40,100,572,102), color=(0.29,0,0.12), fill=(0.29,0,0.12))
+            pg.insert_text((170,125), "PERMISO DE CIRCULACIÓN SIN PLACAS",       fontsize=13, fontname="hebo", color=(0,0,0))
+            pg.insert_text((470,125), str(folio),                                 fontsize=13, fontname="hebo", color=(0.55,0.06,0.12))
+            pg.insert_text((50,160), f"MORELIA, MICH. A  {dia}  DE  {mes}  DEL  {anio}", fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((50,210), "EL GOBIERNO DEL ESTADO CONCEDE PERMISO POR EL TÉRMINO DE TREINTA DÍAS", fontsize=9, fontname="helv", color=(0,0,0))
+            pg.insert_text((50,230), f"AL C.  {str(datos.get('nombre','')).upper()}", fontsize=10, fontname="helv", color=(0,0,0))
+            pg.insert_text((230,290), f"MARCA:  {str(datos.get('marca','')).upper()}", fontsize=9, fontname="helv", color=(0,0,0))
+            pg.insert_text((230,305), f"TIPO:  {str(datos.get('linea','')).upper()}",  fontsize=9, fontname="helv", color=(0,0,0))
+            pg.insert_text((230,320), f"COLOR:  {str(datos.get('color','')).upper()}", fontsize=9, fontname="helv", color=(0,0,0))
+            pg.insert_text((230,335), f"MODELO:  {str(datos.get('anio',''))}",         fontsize=9, fontname="helv", color=(0,0,0))
+            pg.insert_text((230,350), f"NÚM. SERIE:  {str(datos.get('serie','')).upper()}", fontsize=9, fontname="helv", color=(0,0,0))
+            img_qr, _ = generar_qr(folio)
+            if img_qr:
+                buf = BytesIO(); img_qr.save(buf, format="PNG"); buf.seek(0)
+                pg.insert_image(fitz.Rect(160, 300, 235, 375), pixmap=fitz.Pixmap(buf.read()), overlay=True)
+        doc.save(out); doc.close(); print(f"[PDF] ✅ {out}")
+    except Exception as e:
+        print(f"[PDF] Error: {e}")
+        doc_fb = fitz.open(); doc_fb.new_page().insert_text((50,50), f"ERROR - Folio: {folio}", fontsize=12)
+        doc_fb.save(out); doc_fb.close()
+    return out
+
+def generar_subir_y_guardar_pdf(datos_pdf: dict) -> str:
+    folio    = datos_pdf["folio"]
+    ruta_pdf = generar_pdf(datos_pdf)
+    url_pdf  = subir_pdf_a_storage(ruta_pdf, folio)
+    if url_pdf:
+        try: supabase.table("folios_registrados").update({"pdf_url": url_pdf}).eq("folio", folio).execute()
+        except Exception as e: print(f"[DB] ❌ Error guardando pdf_url: {e}")
+    return url_pdf
+
+# ===================== BACKGROUND BOT =====================
+async def generar_y_enviar_background(chat_id: int, datos: dict, user_id: int):
+    folio = datos["folio"]; nombre = datos["nombre"]
+    try:
+        pdf_path = await asyncio.to_thread(generar_pdf, datos)
+        pdf_url  = await asyncio.to_thread(subir_pdf_a_storage, pdf_path, folio)
+        await asyncio.to_thread(lambda: supabase.table("folios_registrados").insert({
+            "folio": folio, "marca": datos["marca"], "linea": datos["linea"],
+            "anio": datos["anio"], "numero_serie": datos["serie"],
+            "numero_motor": datos["motor"], "color": datos["color"],
+            "nombre": nombre,
+            "fecha_expedicion":  datos["fecha_exp_dt"].date().isoformat(),
+            "fecha_vencimiento": (datos["fecha_exp_dt"] + timedelta(days=30)).date().isoformat(),
+            "entidad": ENTIDAD, "estado": "ACTIVO", "estado_pago": "PENDIENTE_PAGO",
+            "user_id": user_id,
+            "creado_por": f"BOT_TG_{datos.get('username','unknown')}",
+            "pdf_url": pdf_url,
+        }).execute())
+        if pdf_url:
+            try: supabase.table("folios_registrados").update({"pdf_url": pdf_url}).eq("folio", folio).execute()
+            except Exception: pass
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Validar Admin",  callback_data=f"validar_{folio}"),
+            InlineKeyboardButton(text="⏹️ Detener Timer", callback_data=f"detener_{folio}")
+        ]])
+        await bot.send_document(chat_id, FSInputFile(pdf_path),
+            caption=(
+                f"📄 PERMISO DE CIRCULACIÓN — MICHOACÁN\n"
+                f"Folio: {folio}\nTitular: {nombre}\n"
+                f"Expedición: {datos['fecha_exp']}\nVencimiento: {datos['fecha_ven']}\n\n"
+                f"⏰ TIMER ACTIVO (36 horas)"
+            ), reply_markup=keyboard)
+        await iniciar_timer_36h(user_id, folio, nombre)
+        await bot.send_message(user_id,
+            f"💰 INSTRUCCIONES DE PAGO — MICHOACÁN\n\n"
+            f"📄 Folio: {folio}\n⏰ Tiempo límite: 36 horas\n\n"
+            f"📸 Envía la foto de tu comprobante aquí mismo.\n"
+            f"⚠️ Sin pago en 36h el folio se elimina.\n\n"
+            f"📋 Use /michoacan para generar otro permiso.")
+    except Exception as e:
+        print(f"[ERROR] background folio {folio}: {e}")
+        try: await bot.send_message(user_id, f"❌ Error al generar el documento: {e}\n\nUse /michoacan para reintentar.")
+        except Exception: pass
+
+# ===================== BOT FSM =====================
+class PermisoForm(StatesGroup):
+    marca=State(); linea=State(); anio=State(); serie=State(); motor=State(); color=State(); nombre=State()
+
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🏛️ GOBIERNO DEL ESTADO DE MICHOACÁN\nDirección de Tránsito Estatal\n\n📋 Use /michoacan para generar un permiso de circulación.")
+
+@dp.message(Command("michoacan"))
+async def michoacan_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    folios_activos = obtener_folios_usuario(message.from_user.id)
+    if folios_activos:
+        texto = "📋 FOLIOS ACTIVOS\n" + "─"*28 + "\n\n"; botones = []
+        for f in folios_activos:
+            if f in timers_activos:
+                seg  = max(0, int(TOTAL_MINUTOS_TIMER*60-(datetime.now()-timers_activos[f]["start_time"]).total_seconds()))
+                h, m = divmod(seg//60, 60); nombre = timers_activos[f].get("nombre","")
+                texto += f"Folio: {f}\n{nombre}\n{h}h {m}min restantes\n\n"
+            else: texto += f"Folio: {f}\n(sin timer)\n\n"
+            botones.append([InlineKeyboardButton(text=f"⏹️ Detener {f}", callback_data=f"detener_{f}")])
+        await message.answer(texto.strip(), reply_markup=InlineKeyboardMarkup(inline_keyboard=botones))
+        await message.answer("Para NUEVO permiso escribe la MARCA del vehículo:")
+    else:
+        await message.answer("🚗 NUEVO PERMISO — MICHOACÁN\n\n⏰ Plazo de pago: 36 horas\n\nPaso 1/7: MARCA del vehículo:")
+    await state.set_state(PermisoForm.marca)
+
+@dp.message(PermisoForm.marca)
+async def get_marca(message: types.Message, state: FSMContext):
+    await state.update_data(marca=message.text.strip().upper())
+    await message.answer("Paso 2/7: LÍNEA/MODELO:"); await state.set_state(PermisoForm.linea)
+
+@dp.message(PermisoForm.linea)
+async def get_linea(message: types.Message, state: FSMContext):
+    await state.update_data(linea=message.text.strip().upper())
+    await message.answer("Paso 3/7: AÑO (4 dígitos):"); await state.set_state(PermisoForm.anio)
+
+@dp.message(PermisoForm.anio)
+async def get_anio(message: types.Message, state: FSMContext):
+    anio = message.text.strip()
+    if not anio.isdigit() or len(anio) != 4:
+        await message.answer("⚠️ Año inválido. Usa 4 dígitos (ej. 2021):"); return
+    await state.update_data(anio=anio)
+    await message.answer("Paso 4/7: NÚMERO DE SERIE:"); await state.set_state(PermisoForm.serie)
+
+@dp.message(PermisoForm.serie)
+async def get_serie(message: types.Message, state: FSMContext):
+    await state.update_data(serie=message.text.strip().upper())
+    await message.answer("Paso 5/7: NÚMERO DE MOTOR:"); await state.set_state(PermisoForm.motor)
+
+@dp.message(PermisoForm.motor)
+async def get_motor(message: types.Message, state: FSMContext):
+    await state.update_data(motor=message.text.strip().upper())
+    await message.answer("Paso 6/7: COLOR:"); await state.set_state(PermisoForm.color)
+
+@dp.message(PermisoForm.color)
+async def get_color(message: types.Message, state: FSMContext):
+    await state.update_data(color=message.text.strip().upper())
+    await message.answer("Paso 7/7: NOMBRE COMPLETO del titular:"); await state.set_state(PermisoForm.nombre)
+
+@dp.message(PermisoForm.nombre)
+async def get_nombre(message: types.Message, state: FSMContext):
+    datos = await state.get_data(); datos["nombre"] = message.text.strip().upper()
+    datos["username"] = message.from_user.username or "Sin username"
+    datos["folio"]    = await _generar_folio_async()
+    tz = ZoneInfo(TZ); hoy = datetime.now(tz); ven = hoy + timedelta(days=30)
+    datos["fecha_exp"] = hoy.strftime("%d/%m/%Y"); datos["fecha_ven"] = ven.strftime("%d/%m/%Y")
+    datos["fecha_exp_dt"] = hoy
+    await state.clear()
+    await message.answer(f"🔄 Generando permiso...\n📄 Folio: {datos['folio']}\n👤 Titular: {datos['nombre']}")
+    asyncio.create_task(generar_y_enviar_background(message.chat.id, datos, message.from_user.id))
+
+@dp.message(lambda m: m.text and m.text.strip().upper().startswith("SERO"))
+async def codigo_admin(message: types.Message):
+    texto = message.text.strip().upper(); folio = texto.replace("SERO","",1).strip()
+    if not folio or not folio.startswith(FOLIO_NUM_PREF):
+        await message.answer(f"⚠️ Formato: SERO{FOLIO_NUM_PREF}X\n\n📋 Use /michoacan para otro permiso."); return
+    cancelado = cancelar_timer_folio(folio)
+    with suppress(Exception):
+        await asyncio.to_thread(lambda: supabase.table("folios_registrados").update({
+            "estado_pago": "VALIDADO", "fecha_comprobante": datetime.now().isoformat()
+        }).eq("folio", folio).execute())
+    msg = f"✅ Validación admin\nFolio: {folio}\n" + ("⏹️ Timer cancelado" if cancelado else "⚠️ Timer ya inactivo")
+    await message.answer(msg + "\n\n📋 Use /michoacan para otro permiso.")
+
+@dp.message(lambda m: m.content_type == ContentType.PHOTO)
+async def recibir_comprobante(message: types.Message):
+    uid = message.from_user.id; folios = obtener_folios_usuario(uid)
+    if not folios:
+        await message.answer("ℹ️ No tienes folios pendientes.\n\n📋 Use /michoacan para generar un permiso."); return
+    if len(folios) > 1:
+        lista = "\n".join(f"• {f}" for f in folios); pending_comprobantes[uid] = "waiting_folio"
+        await message.answer(f"📄 Varios folios activos:\n\n{lista}\n\nResponde con el NÚMERO DE FOLIO.\n\n📋 Use /michoacan para otro permiso."); return
+    folio = folios[0]; cancelar_timer_folio(folio)
+    with suppress(Exception):
+        await asyncio.to_thread(lambda: supabase.table("folios_registrados").update({
+            "estado": "COMPROBANTE_ENVIADO", "fecha_comprobante": datetime.now().isoformat()
+        }).eq("folio", folio).execute())
+    await message.answer(f"✅ Comprobante recibido\nFolio: {folio}\n⏹️ Timer detenido.\n\n📋 Use /michoacan para otro permiso.")
+
+@dp.message(lambda m: m.from_user.id in pending_comprobantes and pending_comprobantes[m.from_user.id] == "waiting_folio")
+async def especificar_folio_comprobante(message: types.Message):
+    uid = message.from_user.id; fe = message.text.strip().upper(); fl = obtener_folios_usuario(uid)
+    if fe not in fl:
+        await message.answer("❌ Folio no en tu lista.\n\n📋 Use /michoacan para otro permiso."); return
+    cancelar_timer_folio(fe); del pending_comprobantes[uid]
+    with suppress(Exception):
+        await asyncio.to_thread(lambda: supabase.table("folios_registrados").update({
+            "estado": "COMPROBANTE_ENVIADO", "fecha_comprobante": datetime.now().isoformat()
+        }).eq("folio", fe).execute())
+    await message.answer(f"✅ Comprobante asociado.\nFolio: {fe}\n\n📋 Use /michoacan para otro permiso.")
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("validar_"))
+async def callback_validar(callback: CallbackQuery):
+    folio = callback.data.replace("validar_","")
+    if folio in timers_activos:
+        uid = timers_activos[folio]["user_id"]; nombre = timers_activos[folio].get("nombre","")
+        cancelar_timer_folio(folio)
+        with suppress(Exception):
+            await asyncio.to_thread(lambda: supabase.table("folios_registrados").update({
+                "estado_pago":"VALIDADO","fecha_comprobante":datetime.now().isoformat()
+            }).eq("folio",folio).execute())
+        await callback.answer("✅ Folio validado",show_alert=True)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        try: await bot.send_message(uid, f"✅ PAGO VALIDADO — MICHOACÁN\nFolio: {folio}\nTitular: {nombre}\nTu permiso está activo.\n\n📋 Use /michoacan para otro permiso.")
+        except Exception as e: print(f"[ERROR] notificando usuario: {e}")
+    else: await callback.answer("❌ Folio no encontrado en timers activos",show_alert=True)
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("detener_"))
+async def callback_detener(callback: CallbackQuery):
+    folio = callback.data.replace("detener_","")
+    if folio in timers_activos:
+        nombre = timers_activos[folio].get("nombre",""); cancelar_timer_folio(folio)
+        with suppress(Exception):
+            await asyncio.to_thread(lambda: supabase.table("folios_registrados").update({"estado":"TIMER_DETENIDO"}).eq("folio",folio).execute())
+        await callback.answer("⏹️ Timer detenido",show_alert=True)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(f"⏹️ TIMER DETENIDO\nFolio: {folio}\nTitular: {nombre}\n\n📋 Use /michoacan para otro permiso.")
+    else: await callback.answer("❌ Timer ya no está activo",show_alert=True)
+
+@dp.message(Command("folios"))
+async def ver_folios_activos(message: types.Message):
+    uid = message.from_user.id; folios = obtener_folios_usuario(uid)
+    if not folios:
+        await message.answer("ℹ️ No hay folios activos.\n\n📋 Use /michoacan para generar uno."); return
+    lista = []; botones = []
+    for f in folios:
+        if f in timers_activos:
+            seg = max(0, int(TOTAL_MINUTOS_TIMER*60-(datetime.now()-timers_activos[f]["start_time"]).total_seconds()))
+            h, m = divmod(seg//60, 60); nombre = timers_activos[f].get("nombre","")
+            lista.append(f"• {f} — {nombre}\n  {h}h {m}min restantes")
+        else: lista.append(f"• {f} (sin timer)")
+        botones.append([InlineKeyboardButton(text=f"⏹️ Detener {f}", callback_data=f"detener_{f}")])
+    await message.answer(f"📋 FOLIOS ACTIVOS ({len(folios)})\n\n" + "\n\n".join(lista) + "\n\n📋 Use /michoacan para otro permiso.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=botones))
+
+@dp.message()
+async def fallback(message: types.Message):
+    await message.answer("🏛️ Gobierno del Estado de Michoacán — Tránsito Estatal.\n\n📋 Use /michoacan para generar un permiso.")
+
+# ===================== HTML CSS =====================
 CSS = f"""
 *{{font-family:'Segoe UI',sans-serif;box-sizing:border-box;}}
 body{{margin:0;background:#f4f4f4;}}
@@ -115,7 +495,7 @@ body{{margin:0;background:#f4f4f4;}}
 .navbar img{{height:55px;object-fit:contain;max-width:220px;}}
 .hamburger{{display:flex;flex-direction:column;gap:5px;cursor:pointer;padding:4px;}}
 .hamburger span{{display:block;width:26px;height:3px;background:{C1};border-radius:2px;}}
-.sidenav{{position:fixed;top:0;right:-280px;width:280px;height:100%;background:white;z-index:200;transition:.3s;box-shadow:-4px 0 20px rgba(0,0,0,.15);}}
+.sidenav{{position:fixed;top:0;right:-280px;width:280px;height:100%;background:white;z-index:200;transition:.3s;box-shadow:-4px 0 20px rgba(0,0,0,.15);overflow-y:auto;}}
 .sidenav.open{{right:0;}}
 .sidenav-header{{background:{C1};padding:20px 16px;color:white;}}
 .sidenav-header img{{height:45px;filter:brightness(10);margin-bottom:8px;display:block;}}
@@ -124,7 +504,7 @@ body{{margin:0;background:#f4f4f4;}}
 .sidenav ul li a{{display:flex;align-items:center;gap:12px;padding:14px 20px;color:#333;text-decoration:none;font-size:14px;font-weight:600;transition:.15s;border-bottom:1px solid #f0f0f0;}}
 .sidenav ul li a:hover{{background:#fef5f7;color:{C1};}}
 .sidenav ul li a i{{color:{C1};width:18px;text-align:center;}}
-.sidenav ul li a.danger{{color:#c00;}} .sidenav ul li a.danger i{{color:#c00;}}
+.sidenav ul li a.danger{{color:#c00;}}.sidenav ul li a.danger i{{color:#c00;}}
 .overlay{{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:199;display:none;}}
 .overlay.show{{display:block;}}
 .admin-bar{{background:{C1};color:white;padding:10px 16px;font-weight:700;font-size:13px;display:flex;align-items:center;gap:8px;}}
@@ -138,29 +518,28 @@ body{{margin:0;background:#f4f4f4;}}
 .menu-btn:hover{{border-color:{C1};color:{C1};transform:translateY(-2px);box-shadow:0 4px 14px rgba(74,0,31,.15);}}
 .menu-btn i{{font-size:28px;display:block;margin-bottom:8px;color:{C1};}}
 .menu-btn span{{font-size:13px;font-weight:600;}}
-.menu-btn.danger{{border-color:#e8e8e8;}}
-.menu-btn.danger i{{color:#dc3545;}}
-.menu-btn.danger:hover{{border-color:#dc3545;color:#dc3545;}}
+.menu-btn.danger i{{color:#dc3545;}}.menu-btn.danger:hover{{border-color:#dc3545;color:#dc3545;}}
 table{{font-size:12px;width:100%;border-collapse:collapse;}}
 thead th{{background:{C1};color:white;padding:10px 8px;text-align:left;white-space:nowrap;}}
 tbody td{{padding:9px 8px;vertical-align:middle;border-bottom:1px solid #eee;}}
-tbody tr:last-child td{{border-bottom:none;}} tbody tr:hover td{{background:#fef5f7;}}
+tbody tr:last-child td{{border-bottom:none;}}tbody tr:hover td{{background:#fef5f7;}}
 .tabla-wrap{{overflow-x:auto;background:white;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.08);}}
 .bp{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;color:white;}}
 .bp-p{{background:#dc3545;}}.bp-v{{background:#1a6e2e;}}.bp-vig{{background:#1a6e2e;}}.bp-ven{{background:{C1};}}
 .form-card{{background:white;border-radius:12px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.08);}}
 .form-label{{font-weight:600;font-size:14px;display:block;margin-bottom:4px;}}
-.form-control{{display:block;width:100%;padding:10px 12px;border:1.5px solid #ddd;border-radius:8px;font-size:14px;transition:.2s;}}
+.form-control{{display:block;width:100%;padding:10px 12px;border:1.5px solid #ddd;border-radius:8px;font-size:14px;transition:.2s;font-family:inherit;}}
 .form-control:focus{{border-color:{C1};outline:none;box-shadow:0 0 0 3px rgba(74,0,31,.1);}}
-.mb-3{{margin-bottom:14px;}} .mb-4{{margin-bottom:20px;}} .mt-3{{margin-top:14px;}} .mt-4{{margin-top:20px;}}
-.btn{{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:11px 20px;border-radius:8px;font-weight:700;font-size:14px;border:none;cursor:pointer;text-decoration:none;transition:.2s;}}
+select.form-control{{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23666' d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px;}}
+.mb-3{{margin-bottom:14px;}}.mb-4{{margin-bottom:20px;}}.mt-3{{margin-top:14px;}}.mt-4{{margin-top:20px;}}
+.btn{{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:11px 20px;border-radius:8px;font-weight:700;font-size:14px;border:none;cursor:pointer;text-decoration:none;transition:.2s;font-family:inherit;}}
 .btn-primary{{background:{C1};color:white;width:100%;}}
 .btn-primary:hover{{background:{C2};}}
 .btn-sm{{padding:5px 12px;font-size:11px;border-radius:6px;}}
 .btn-outline{{background:white;border:1.5px solid #ddd;color:#444;}}
 .btn-outline:hover{{border-color:{C1};color:{C1};}}
-.btn-danger{{background:#dc3545;color:white;}} .btn-danger:hover{{background:#b02a37;}}
-.btn-success{{background:#1a6e2e;color:white;}} .btn-success:hover{{background:#145523;}}
+.btn-danger{{background:#dc3545;color:white;}}.btn-danger:hover{{background:#b02a37;}}
+.btn-success{{background:#1a6e2e;color:white;}}.btn-success:hover{{background:#145523;}}
 .alert{{padding:12px 14px;border-radius:8px;margin-bottom:14px;font-size:13px;font-weight:600;}}
 .alert-ok{{background:#d4edda;color:#155724;border:1px solid #c3e6cb;}}
 .alert-err{{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;}}
@@ -176,36 +555,28 @@ tbody tr:last-child td{{border-bottom:none;}} tbody tr:hover td{{background:#fef
 .toast-f.show{{opacity:1;}}.toast-f.ok{{background:#e6ffee;border-color:#060;color:#060;}}.toast-f.err{{background:#fff0f0;border-color:#c00;color:#c00;}}
 .row-2{{display:grid;grid-template-columns:1fr 1fr;gap:12px;}}
 .row-3{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}}
-select.form-control{{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23666' d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;padding-right:32px;}}
 .filter-bar{{background:white;border-radius:12px;padding:14px;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:14px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;}}
-.filter-bar input,.filter-bar select{{flex:1;min-width:120px;}}
 .page-title{{font-size:20px;font-weight:700;color:{C1};margin-bottom:16px;}}
 .modal-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;}}
 .modal-box{{background:white;border-radius:16px;padding:28px;max-width:360px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.3);}}
 """
 
-JS_NAV = """
-<script>
+FA = '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">'
+JS_NAV = """<script>
 function openNav(){document.getElementById('sidenav').classList.add('open');document.getElementById('overlay').classList.add('show');}
 function closeNav(){document.getElementById('sidenav').classList.remove('open');document.getElementById('overlay').classList.remove('show');}
-document.addEventListener('DOMContentLoaded',function(){
-  document.getElementById('overlay').addEventListener('click',closeNav);
-});
+document.addEventListener('DOMContentLoaded',function(){document.getElementById('overlay').addEventListener('click',closeNav);});
 </script>"""
-
-FA = '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">'
 
 def head(titulo):
     return f"""<!DOCTYPE html><html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{titulo} — Michoacán</title>
 <link rel="icon" href="https://michoacan.gob.mx/wp-content/uploads/2021/09/cropped-LogoGobMich-Escudo-Guinda-600-600-32x32.png" sizes="32x32"/>
-{FA}
-<style>{CSS}</style></head><body>"""
+{FA}<style>{CSS}</style></head><body>"""
 
 def navbar():
-    return f"""
-<nav class="navbar">
+    return f"""<nav class="navbar">
   <img src="https://michoacan.gob.mx/cdn/img/logo.svg?ver=6" alt="Michoacán">
   <div class="hamburger" onclick="openNav()"><span></span><span></span><span></span></div>
 </nav>
@@ -228,7 +599,7 @@ def navbar():
 </div>"""
 
 def admin_bar(seccion):
-    return f'<div class="admin-bar"><i class="fa-solid fa-shield-halved me-2"></i>{seccion}</div>'
+    return f'<div class="admin-bar"><i class="fa-solid fa-shield-halved"></i> {seccion}</div>'
 
 def footer(scripts=""):
     return f"""{scripts}{JS_NAV}</body></html>"""
@@ -236,9 +607,8 @@ def footer(scripts=""):
 def page(titulo, seccion, contenido, scripts=""):
     return head(titulo) + navbar() + admin_bar(seccion) + f'<div class="content">{contenido}</div>' + footer(scripts)
 
-# ===================== LOGIN =====================
 def login_html(error=False):
-    err = '<div class="alert alert-err mb-3"><i class="fa-solid fa-triangle-exclamation"></i> Usuario o contraseña incorrectos</div>' if error else ""
+    err = '<div class="alert alert-err"><i class="fa-solid fa-triangle-exclamation"></i> Usuario o contraseña incorrectos</div>' if error else ""
     return f"""<!DOCTYPE html><html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Acceso — Michoacán Tránsito</title>
@@ -258,7 +628,7 @@ body{{background:{C1};min-height:100vh;margin:0;display:flex;flex-direction:colu
 .form-control{{display:block;width:100%;padding:11px 13px;border:1.5px solid #ddd;border-radius:8px;font-size:14px;font-family:inherit;}}
 .form-control:focus{{border-color:{C1};outline:none;box-shadow:0 0 0 3px rgba(74,0,31,.1);}}
 .mb-3{{margin-bottom:14px;}}.mb-4{{margin-bottom:20px;}}
-.alert{{padding:11px 13px;border-radius:8px;font-size:13px;font-weight:600;}}
+.alert{{padding:11px 13px;border-radius:8px;font-size:13px;font-weight:600;margin-bottom:14px;}}
 .alert-err{{background:#f8d7da;color:#721c24;border:1px solid #f5c6cb;}}
 .btn-in{{background:{C1};border:none;color:white;width:100%;padding:13px;font-weight:700;font-size:15px;border-radius:8px;cursor:pointer;font-family:inherit;}}
 .btn-in:hover{{background:{C2};}}
@@ -280,16 +650,42 @@ body{{background:{C1};min-height:100vh;margin:0;display:flex;flex-direction:colu
 </body></html>"""
 
 # ===================== LIFESPAN =====================
+_keep_task = None
+async def keep_alive():
+    while True:
+        await asyncio.sleep(600)
+        print("[HEARTBEAT] Sistema Michoacán activo")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _keep_task
     await asyncio.to_thread(_sb_inicializar_folio)
-    print(f"[SISTEMA] Michoacán v1.0 — siguiente folio: {FOLIO_NUM_PREF}{_folio_counter['siguiente']}")
+    await bot.delete_webhook(drop_pending_updates=True)
+    webhook_url = f"{BASE_URL}/webhook"
+    await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
+    _keep_task = asyncio.create_task(keep_alive())
+    print(f"[WEBHOOK] {webhook_url}")
+    print(f"[SISTEMA] Michoacán v2.0 — siguiente folio: {FOLIO_NUM_PREF}{_folio_counter['siguiente']}")
     yield
+    if _keep_task:
+        _keep_task.cancel()
+        with suppress(asyncio.CancelledError): await _keep_task
+    await bot.session.close()
 
-app = FastAPI(lifespan=lifespan, title="Tránsito Michoacán", version="1.0")
+app = FastAPI(lifespan=lifespan, title="Tránsito Michoacán", version="2.0")
 app.add_middleware(SessionMiddleware, secret_key="michoacan_clave_super_segura_123456")
 try: app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 except Exception: pass
+
+# ===================== WEBHOOK =====================
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        data = await request.json()
+        await dp.feed_webhook_update(bot, types.Update(**data))
+        return {"ok": True}
+    except Exception as e:
+        print(f"[WEBHOOK] Error: {e}"); return {"ok": False, "error": str(e)}
 
 # ===================== AUTH =====================
 @app.get("/", response_class=HTMLResponse)
@@ -311,8 +707,8 @@ async def login_post(request: Request, username: str = Form(...), password: str 
     try:
         res = supabase.table("verificacion_michoacan").select("*").eq("username",username).eq("password",password).execute()
         if res.data:
-            u = res.data[0]
-            request.session["admin"] = False; request.session["username"] = u["username"]; request.session["user_id"] = u.get("id")
+            u = res.data[0]; request.session["admin"] = False
+            request.session["username"] = u["username"]; request.session["user_id"] = u.get("id")
             return RedirectResponse(url="/registro_usuario", status_code=303)
     except Exception as e: print(f"[LOGIN] Error: {e}")
     return RedirectResponse(url="/panel/login?error=1", status_code=303)
@@ -333,7 +729,7 @@ async def panel_admin(request: Request):
     color_pend = "#dc3545" if pendientes else "#1a6e2e"
     contenido = f"""
     <div class="row-2 mb-3">
-      <div class="stat-card"><div class="stat-num">0</div><div class="stat-lbl">Timers Activos</div></div>
+      <div class="stat-card"><div class="stat-num">{len(timers_activos)}</div><div class="stat-lbl">Timers Activos</div></div>
       <div class="stat-card"><div class="stat-num" style="color:{color_pend}">{pendientes}</div><div class="stat-lbl">Pendientes Pago</div></div>
     </div>
     <div class="stat-card mb-3"><div class="stat-num">{FOLIO_NUM_PREF}{_folio_counter['siguiente']}</div><div class="stat-lbl">Siguiente Folio</div></div>
@@ -404,18 +800,18 @@ async def admin_folios(request: Request):
         </tr>"""
     filtros = f"""<div class="filter-bar">
       <form method="GET" style="display:contents">
-        <input type="text" name="filtro" class="form-control" value="{filtro}" placeholder="Buscar folio, nombre...">
-        <select name="criterio" class="form-control" style="max-width:110px">
+        <input type="text" name="filtro" class="form-control" value="{filtro}" placeholder="Buscar...">
+        <select name="criterio" class="form-control" style="max-width:100px">
           <option value="folio" {"selected" if crit=="folio" else ""}>Folio</option>
           <option value="nombre" {"selected" if crit=="nombre" else ""}>Nombre</option>
           <option value="numero_serie" {"selected" if crit=="numero_serie" else ""}>Serie</option>
         </select>
-        <select name="estado_pago" class="form-control" style="max-width:110px">
+        <select name="estado_pago" class="form-control" style="max-width:100px">
           <option value="todos" {"selected" if ep_fil=="todos" else ""}>Todos</option>
           <option value="PENDIENTE_PAGO" {"selected" if ep_fil=="PENDIENTE_PAGO" else ""}>Pendiente</option>
           <option value="VALIDADO" {"selected" if ep_fil=="VALIDADO" else ""}>Validado</option>
         </select>
-        <select name="estado_vigencia" class="form-control" style="max-width:110px">
+        <select name="estado_vigencia" class="form-control" style="max-width:100px">
           <option value="todos" {"selected" if ev_fil=="todos" else ""}>Todos</option>
           <option value="VIGENTE" {"selected" if ev_fil=="VIGENTE" else ""}>Vigente</option>
           <option value="VENCIDO" {"selected" if ev_fil=="VENCIDO" else ""}>Vencido</option>
@@ -423,7 +819,7 @@ async def admin_folios(request: Request):
         <button type="submit" class="btn btn-primary btn-sm" style="width:auto">Filtrar</button>
         <a href="/panel/folios" class="btn btn-outline btn-sm">✕</a>
       </form>
-      <span style="font-size:12px;color:#888;margin-left:auto">{len(folios)} resultados</span>
+      <span style="font-size:12px;color:#888">{len(folios)} resultados</span>
     </div>"""
     contenido = f"""{modal_html}
     <p class="page-title">Folios Registrados</p>
@@ -438,7 +834,13 @@ async def admin_folios(request: Request):
 async def validar_pago(request: Request, folio: str):
     if not request.session.get("admin"): return RedirectResponse(url="/panel/login", status_code=303)
     folio = folio.strip().upper()
-    try: supabase.table("folios_registrados").update({"estado_pago":"VALIDADO"}).eq("folio",folio).execute()
+    try:
+        supabase.table("folios_registrados").update({"estado_pago":"VALIDADO"}).eq("folio",folio).execute()
+        if folio in timers_activos:
+            uid = timers_activos[folio]["user_id"]; nombre = timers_activos[folio].get("nombre","")
+            cancelar_timer_folio(folio)
+            try: await bot.send_message(uid, f"✅ PAGO VALIDADO — MICHOACÁN\nFolio: {folio}\nTitular: {nombre}\nTu permiso está activo.\n\n📋 Use /michoacan para otro permiso.")
+            except Exception: pass
     except Exception as e: print(f"[VALIDAR] Error: {e}")
     from urllib.parse import quote
     return RedirectResponse(url=f"/panel/folios?msg={quote(f'Folio {folio} validado ✅')}", status_code=303)
@@ -455,7 +857,7 @@ async def descargar_pdf_panel(folio: str, request: Request):
     if os.path.exists(ruta):
         from fastapi.responses import FileResponse
         return FileResponse(ruta, media_type="application/pdf", filename=f"{folio}_michoacan.pdf")
-    return HTMLResponse(f"<p>PDF {folio} no encontrado.</p><a href='/panel/folios'>← Volver</a>", status_code=404)
+    return HTMLResponse(f"<p>PDF no encontrado.</p><a href='/panel/folios'>← Volver</a>", status_code=404)
 
 # ===================== REGISTRO ADMIN =====================
 @app.get("/panel/registro_admin", response_class=HTMLResponse)
@@ -465,8 +867,7 @@ async def registro_admin_get(request: Request):
     err = request.query_params.get("error","")
     err_html = f'<div class="alert alert-err">{err}</div>' if err else ""
     contenido = f"""
-    <p class="page-title">Registrar Permiso</p>
-    {err_html}
+    <p class="page-title">Registrar Permiso</p>{err_html}
     <div class="form-card">
       <form method="POST" action="/panel/registro_admin">
         <div class="mb-3"><label class="form-label">Folio manual <small style="color:#999;font-weight:400">(vacío = auto)</small></label>
@@ -506,15 +907,17 @@ async def registro_admin_post(request: Request,
         fg = folio.strip().upper() if folio and folio.strip() else generar_folio()
         fe = datetime.fromisoformat(fecha_expedicion).date() if fecha_expedicion and fecha_expedicion.strip() else datetime.now(tz).date()
         fv = datetime.fromisoformat(fecha_vencimiento).date() if fecha_vencimiento and fecha_vencimiento.strip() else fe + timedelta(days=30)
-        supabase.table("folios_registrados").insert({
-            "folio": fg, "marca": marca.upper(), "linea": linea.upper(), "anio": anio,
-            "numero_serie": numero_serie.upper(), "numero_motor": numero_motor.upper(),
-            "color": color.upper(), "nombre": nombre.upper(),
-            "fecha_expedicion": fe.isoformat(), "fecha_vencimiento": fv.isoformat(),
-            "entidad": ENTIDAD, "estado": "ACTIVO", "estado_pago": "VALIDADO",
-            "creado_por": request.session.get("username","admin")
-        }).execute()
-        return RedirectResponse(url=f"/panel/folios?msg={quote(f'Permiso {fg} generado ✅')}", status_code=303)
+        datos_pdf = {"folio": fg, "marca": marca.upper(), "linea": linea.upper(), "anio": anio,
+            "serie": numero_serie.upper(), "motor": numero_motor.upper(), "color": color.upper(),
+            "nombre": nombre.upper(), "fecha_exp": fe.strftime("%d/%m/%Y"), "fecha_ven": fv.strftime("%d/%m/%Y"),
+            "fecha_exp_dt": datetime.combine(fe, datetime.min.time()).replace(tzinfo=tz)}
+        supabase.table("folios_registrados").insert({"folio": fg, "marca": marca.upper(), "linea": linea.upper(),
+            "anio": anio, "numero_serie": numero_serie.upper(), "numero_motor": numero_motor.upper(),
+            "color": color.upper(), "nombre": nombre.upper(), "fecha_expedicion": fe.isoformat(),
+            "fecha_vencimiento": fv.isoformat(), "entidad": ENTIDAD, "estado": "ACTIVO",
+            "estado_pago": "VALIDADO", "creado_por": request.session.get("username","admin")}).execute()
+        pdf_url = await asyncio.to_thread(generar_subir_y_guardar_pdf, datos_pdf)
+        return RedirectResponse(url=f"/panel/folios?msg={quote(f'Permiso {fg} generado ✅')}&pdf={quote(pdf_url)}", status_code=303)
     except Exception as e:
         print(f"[REGISTRO ADMIN] Error: {e}")
         return RedirectResponse(url=f"/panel/registro_admin?error={quote(str(e))}", status_code=303)
@@ -524,11 +927,10 @@ async def registro_admin_post(request: Request,
 async def crear_usuario_get(request: Request):
     if not request.session.get("admin"): return RedirectResponse(url="/panel/login", status_code=303)
     msg = request.query_params.get("msg",""); err = request.query_params.get("error","")
-    msg_html = f'<div class="alert alert-ok">{msg}</div>' if msg else ""
-    err_html = f'<div class="alert alert-err">{err}</div>' if err else ""
     contenido = f"""
     <p class="page-title">Crear Usuario</p>
-    {msg_html}{err_html}
+    {"<div class='alert alert-ok'>"+msg+"</div>" if msg else ""}
+    {"<div class='alert alert-err'>"+err+"</div>" if err else ""}
     <div class="form-card">
       <form method="POST" action="/panel/crear_usuario">
         <div class="mb-3"><label class="form-label">Usuario *</label><input type="text" name="username" class="form-control" required autocomplete="off"></div>
@@ -562,8 +964,6 @@ async def registro_usuario_get(request: Request):
     disp = asig - usad; porc = round((usad/asig*100) if asig else 0, 1)
     tz = ZoneInfo(TZ); hoy = datetime.now(tz).strftime("%Y-%m-%d")
     msg = request.query_params.get("msg",""); err = request.query_params.get("error","")
-    msg_html = f'<div class="alert alert-ok">{msg}</div>' if msg else ""
-    err_html = f'<div class="alert alert-err">{err}</div>' if err else ""
     form_html = f"""<div class="form-card">
       <form method="POST" action="/registro_usuario">
         <div class="row-2">
@@ -586,7 +986,7 @@ async def registro_usuario_get(request: Request):
     contenido = f"""
     <p class="page-title">Registrar Permiso — Michoacán</p>
     <div class="form-card mb-3">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;margin-bottom:8px">
         <span style="font-weight:700;font-size:14px">Mis Folios</span>
         <span style="font-size:12px;color:#888">{usad} / {asig}</span>
       </div>
@@ -595,7 +995,9 @@ async def registro_usuario_get(request: Request):
         <span>Usados: <strong>{usad}</strong></span><span>Total: <strong>{asig}</strong></span><span>Disponibles: <strong style="color:{C1}">{disp}</strong></span>
       </div>
     </div>
-    {msg_html}{err_html}{form_html}
+    {"<div class='alert alert-ok'>"+msg+"</div>" if msg else ""}
+    {"<div class='alert alert-err'>"+err+"</div>" if err else ""}
+    {form_html}
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
       <a href="/mis_permisos" class="btn btn-outline btn-sm">📋 Mis Permisos</a>
       <a href="/consulta_folio" class="btn btn-outline btn-sm">🔍 Consultar</a>
@@ -625,21 +1027,24 @@ async def registro_usuario_post(request: Request,
         tz = ZoneInfo(TZ)
         fe = datetime.strptime(fecha_inicio, "%Y-%m-%d").replace(tzinfo=tz) if fecha_inicio else datetime.now(tz)
         fv = fe + timedelta(days=30); fg = generar_folio()
-        supabase.table("folios_registrados").insert({
-            "folio": fg, "marca": marca.upper(), "linea": linea.upper(), "anio": anio,
-            "numero_serie": serie.upper(), "numero_motor": motor.upper(),
-            "color": color.upper(), "nombre": nombre.upper(),
-            "fecha_expedicion": fe.date().isoformat(), "fecha_vencimiento": fv.date().isoformat(),
-            "entidad": ENTIDAD, "estado": "ACTIVO", "estado_pago": "VALIDADO",
-            "user_id": request.session.get("user_id"), "creado_por": request.session["username"]
-        }).execute()
+        supabase.table("folios_registrados").insert({"folio": fg, "marca": marca.upper(), "linea": linea.upper(),
+            "anio": anio, "numero_serie": serie.upper(), "numero_motor": motor.upper(),
+            "color": color.upper(), "nombre": nombre.upper(), "fecha_expedicion": fe.date().isoformat(),
+            "fecha_vencimiento": fv.date().isoformat(), "entidad": ENTIDAD, "estado": "ACTIVO",
+            "estado_pago": "VALIDADO", "user_id": request.session.get("user_id"),
+            "creado_por": request.session["username"]}).execute()
+        datos_pdf = {"folio": fg, "marca": marca.upper(), "linea": linea.upper(), "anio": anio,
+            "serie": serie.upper(), "motor": motor.upper(), "color": color.upper(),
+            "nombre": nombre.upper(), "fecha_exp": fe.strftime("%d/%m/%Y"),
+            "fecha_ven": fv.strftime("%d/%m/%Y"), "fecha_exp_dt": fe}
+        pdf_url = await asyncio.to_thread(generar_subir_y_guardar_pdf, datos_pdf)
         supabase.table("verificacion_michoacan").update({"folios_usados": usad+1}).eq("username", request.session["username"]).execute()
         contenido = f"""
         <p class="page-title">✅ Permiso Generado</p>
         <div class="form-card" style="text-align:center">
           <div style="font-size:52px;margin-bottom:12px">📄</div>
           <h2 style="color:{C1};font-size:24px;font-weight:700;margin-bottom:4px">{fg}</h2>
-          <p style="color:#888;font-size:13px;margin-bottom:16px">Folio de circulación generado correctamente</p>
+          <p style="color:#888;font-size:13px;margin-bottom:16px">Folio generado correctamente</p>
           <div class="info-box" style="text-align:left">
             <strong>Vehículo:</strong> {marca.upper()} {linea.upper()} {anio}<br>
             <strong>Serie:</strong> {serie.upper()}<br>
@@ -647,6 +1052,7 @@ async def registro_usuario_post(request: Request,
             <strong>Expedición:</strong> {fe.strftime("%d/%m/%Y")}<br>
             <strong>Vencimiento:</strong> {fv.strftime("%d/%m/%Y")}
           </div>
+          {"<a href='"+pdf_url+"' target='_blank' class='btn btn-primary mb-3'><i class='fa-solid fa-download'></i> Descargar PDF</a>" if pdf_url else ""}
           <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
             <a href="/mis_permisos" class="btn btn-outline btn-sm">📋 Mis Permisos</a>
             <a href="/registro_usuario" class="btn btn-primary btn-sm" style="width:auto">+ Nuevo</a>
@@ -671,6 +1077,7 @@ async def mis_permisos(request: Request):
     ud = supabase.table("verificacion_michoacan").select("folios_asignac,folios_usados").eq("username", request.session["username"]).limit(1).execute().data
     ud = ud[0] if ud else {"folios_asignac":0,"folios_usados":0}
     asig = int(ud.get("folios_asignac",0)); usad = int(ud.get("folios_usados",0))
+    vig  = len([p for p in permisos if p.get("estado_calc")=="VIGENTE"])
     filas = ""
     for p in permisos:
         ec  = p.get("estado_calc","")
@@ -681,8 +1088,7 @@ async def mis_permisos(request: Request):
           <td><strong style="color:{C1}">{p.get("folio","")}</strong></td>
           <td>{p.get("marca","")} {p.get("linea","")}<br><small>{p.get("anio","")}</small></td>
           <td style="font-size:11px">{p.get("numero_serie","")}</td>
-          <td>{p.get("fe_fmt","")}</td>
-          <td>{be}</td>
+          <td>{p.get("fe_fmt","")}</td><td>{be}</td>
           <td>{btn}<a href="/consulta/{p.get('folio','')}" target="_blank" class="btn btn-sm btn-outline">🔗</a></td>
         </tr>"""
     contenido = f"""
@@ -690,7 +1096,7 @@ async def mis_permisos(request: Request):
     <div class="grid mb-3">
       <div class="stat-card"><div class="stat-num">{asig}</div><div class="stat-lbl">Asignados</div></div>
       <div class="stat-card"><div class="stat-num">{asig-usad}</div><div class="stat-lbl">Disponibles</div></div>
-      <div class="stat-card"><div class="stat-num" style="color:#1a6e2e">{len([p for p in permisos if p.get("estado_calc")=="VIGENTE"])}</div><div class="stat-lbl">Vigentes</div></div>
+      <div class="stat-card"><div class="stat-num" style="color:#1a6e2e">{vig}</div><div class="stat-lbl">Vigentes</div></div>
       <div class="stat-card"><div class="stat-num" style="color:{C1}">{len(permisos)}</div><div class="stat-lbl">Total</div></div>
     </div>
     <div class="tabla-wrap"><table>
@@ -698,7 +1104,7 @@ async def mis_permisos(request: Request):
       <tbody>{filas or '<tr><td colspan="6" style="text-align:center;color:#999;padding:20px">Sin permisos</td></tr>'}</tbody>
     </table></div>
     <div style="display:flex;gap:8px;margin-top:12px">
-      <a href="/registro_usuario" class="btn btn-primary btn-sm" style="width:auto">+ Nuevo Permiso</a>
+      <a href="/registro_usuario" class="btn btn-primary btn-sm" style="width:auto">+ Nuevo</a>
       <a href="/panel/logout" class="btn btn-danger btn-sm">🚪 Salir</a>
     </div>"""
     return HTMLResponse(page("Mis Permisos","Mis Permisos — Michoacán", contenido))
@@ -727,53 +1133,43 @@ async def consulta_publica(folio: str):
     try:
         res = supabase.table("folios_registrados").select("*").eq("folio", folio).execute()
         if not res.data:
-            resultado_html = f"""
-            <div style="background:#c0392b;color:white;padding:14px 18px;border-radius:10px;font-size:15px;font-weight:700;text-align:center;margin-bottom:18px">
-              <i class="fa-solid fa-circle-xmark"></i> EL FOLIO {folio} NO SE ENCUENTRA EN SISTEMA
-            </div>"""
+            resultado_html = f'<div style="background:#c0392b;color:white;padding:14px 18px;border-radius:10px;font-size:15px;font-weight:700;text-align:center;margin-bottom:18px"><i class="fa-solid fa-circle-xmark"></i> EL FOLIO {folio} NO SE ENCUENTRA EN SISTEMA</div>'
         else:
             f = res.data[0]; tz=ZoneInfo(TZ); hoy=datetime.now(tz).date()
             fv=datetime.fromisoformat(f["fecha_vencimiento"]).date()
             fe=datetime.fromisoformat(f["fecha_expedicion"]).date()
             vigente=hoy<=fv
-            badge_color="#1a6e2e" if vigente else "#b38b00"
-            badge_text=f"FOLIO {folio} ACTIVO" if vigente else f"FOLIO {folio} VENCIDO"
-            badge_icon="fa-circle-check" if vigente else "fa-clock"
-            validez=f'<div style="background:#e8f5e9;border:1px solid #a5d6a7;color:#1b5e20;border-radius:8px;padding:11px;text-align:center;font-weight:700;font-size:13px;margin-bottom:14px"><i class="fa-solid fa-circle-check"></i> PERMISO VIGENTE</div>' if vigente else '<div style="background:#fff8e1;border:1px solid #ffe082;color:#b38b00;border-radius:8px;padding:11px;text-align:center;font-weight:700;font-size:13px;margin-bottom:14px"><i class="fa-solid fa-clock"></i> PERMISO VENCIDO</div>'
-            def fila_dato(label, valor):
+            bc="#1a6e2e" if vigente else "#b38b00"
+            bt=f"FOLIO {folio} ACTIVO" if vigente else f"FOLIO {folio} VENCIDO"
+            bi="fa-circle-check" if vigente else "fa-clock"
+            vhtml = f'<div style="background:#e8f5e9;border:1px solid #a5d6a7;color:#1b5e20;border-radius:8px;padding:11px;text-align:center;font-weight:700;font-size:13px;margin-bottom:14px"><i class="fa-solid fa-circle-check"></i> PERMISO VIGENTE</div>' if vigente else '<div style="background:#fff8e1;border:1px solid #ffe082;color:#b38b00;border-radius:8px;padding:11px;text-align:center;font-weight:700;font-size:13px;margin-bottom:14px"><i class="fa-solid fa-clock"></i> PERMISO VENCIDO</div>'
+            def fd(label, valor):
                 return f'<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f0f0f0;font-size:13px"><span style="color:#888;font-weight:600">{label}</span><span style="font-weight:600">{valor}</span></div>'
             resultado_html = f"""
-            <div style="background:{badge_color};color:white;padding:14px 18px;border-radius:10px;font-size:15px;font-weight:700;text-align:center;margin-bottom:16px">
-              <i class="fa-solid {badge_icon}"></i> {badge_text}
-            </div>
-            {validez}
+            <div style="background:{bc};color:white;padding:14px 18px;border-radius:10px;font-size:15px;font-weight:700;text-align:center;margin-bottom:16px">
+              <i class="fa-solid {bi}"></i> {bt}
+            </div>{vhtml}
             <div style="background:white;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:14px">
-              <div style="background:{C1};color:white;padding:10px 14px;font-weight:700;font-size:13px"><i class="fa-solid fa-car me-2"></i>Datos del Vehículo</div>
+              <div style="background:{C1};color:white;padding:10px 14px;font-weight:700;font-size:13px"><i class="fa-solid fa-car"></i> Datos del Vehículo</div>
               <div style="padding:0 14px">
-                {fila_dato("Marca", f.get("marca",""))}
-                {fila_dato("Línea", f.get("linea",""))}
-                {fila_dato("Año", f.get("anio",""))}
-                {fila_dato("Núm. Serie", f.get("numero_serie",""))}
-                {fila_dato("Color", f.get("color",""))}
+                {fd("Marca", f.get("marca",""))}{fd("Línea", f.get("linea",""))}{fd("Año", f.get("anio",""))}
+                {fd("Núm. Serie", f.get("numero_serie",""))}{fd("Color", f.get("color",""))}
               </div>
             </div>
             <div style="background:white;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08);margin-bottom:14px">
-              <div style="background:{C1};color:white;padding:10px 14px;font-weight:700;font-size:13px"><i class="fa-solid fa-file-shield me-2"></i>Datos del Permiso</div>
+              <div style="background:{C1};color:white;padding:10px 14px;font-weight:700;font-size:13px"><i class="fa-solid fa-file-shield"></i> Datos del Permiso</div>
               <div style="padding:0 14px">
-                {fila_dato("Folio", f'<span style="color:{C1};font-weight:700">{folio}</span>')}
-                {fila_dato("Titular", f.get("nombre",""))}
-                {fila_dato("Expedición", fe.strftime("%d/%m/%Y"))}
-                {fila_dato("Vencimiento", fv.strftime("%d/%m/%Y"))}
+                {fd("Folio", f'<span style="color:{C1};font-weight:700">{folio}</span>')}
+                {fd("Titular", f.get("nombre",""))}{fd("Expedición", fe.strftime("%d/%m/%Y"))}{fd("Vencimiento", fv.strftime("%d/%m/%Y"))}
               </div>
             </div>"""
         html = f"""<!DOCTYPE html><html lang="es"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Consulta de Folio — Michoacán</title>
 <link rel="icon" href="https://michoacan.gob.mx/wp-content/uploads/2021/09/cropped-LogoGobMich-Escudo-Guinda-600-600-32x32.png" sizes="32x32"/>
-{FA}
-<style>{CSS}</style></head><body>
+{FA}<style>{CSS}</style></head><body>
 <nav class="navbar"><img src="https://michoacan.gob.mx/cdn/img/logo.svg?ver=6" alt="Michoacán"></nav>
-<div class="admin-bar"><i class="fa-solid fa-shield-halved me-2"></i>Verificación de Permiso — Michoacán</div>
+<div class="admin-bar"><i class="fa-solid fa-shield-halved"></i> Verificación de Permiso — Michoacán</div>
 <div class="content" style="max-width:500px">
   {resultado_html}
   <a href="https://michoacan.gob.mx/tramites-vehiculares/" class="btn btn-primary mt-3">
@@ -799,7 +1195,6 @@ async def test_fechas_get(request: Request):
             r = supabase.table("folios_registrados").select("*").eq("folio",fb).execute()
             resultado = (r.data or [None])[0]
         except Exception as e: msg = f"Error: {e}"
-    msg_html = f'<div class="alert alert-ok">{msg}</div>' if msg else ""
     info_html = acc_html = ""
     if resultado:
         info_html = f"""<div class="info-box">
@@ -816,10 +1211,10 @@ async def test_fechas_get(request: Request):
         </form>"""
     contenido = f"""
     <p class="page-title">🧪 Test Fechas</p>
-    {msg_html}
+    {"<div class='alert alert-ok'>"+msg+"</div>" if msg else ""}
     <div class="form-card">
       <form method="GET">
-        <div class="mb-3"><label class="form-label">Folio a probar</label>
+        <div class="mb-3"><label class="form-label">Folio</label>
           <input type="text" name="folio" class="form-control" placeholder="{FOLIO_NUM_PREF}1234" value="{fb}" style="text-transform:uppercase"></div>
         <button type="submit" class="btn btn-primary mb-3">Buscar</button>
       </form>
@@ -848,8 +1243,7 @@ async def test_fechas_post(request: Request, folio: str = Form(...), accion: str
 async def admin_tablas(request: Request):
     if not request.session.get("admin"): return RedirectResponse(url="/panel/login", status_code=303)
     cards = "".join([f"""<div class="form-card mb-3">
-      <div style="font-size:20px;margin-bottom:6px">🗄️</div>
-      <strong style="color:{C1}">{info['nombre']}</strong>
+      <strong style="color:{C1};font-size:15px">🗄️ {info['nombre']}</strong>
       <p style="font-size:12px;color:#888;margin:4px 0 12px"><code>{nombre}</code> · {len(info['columnas'])} columnas</p>
       <a href="/panel/tabla/{nombre}" class="btn btn-primary btn-sm" style="width:auto">Ver y editar →</a>
     </div>""" for nombre, info in TABLAS_DISPONIBLES.items()])
@@ -875,7 +1269,7 @@ async def admin_tabla_detalle(nombre_tabla: str, request: Request):
         for col in columnas:
             val = reg.get(col); disp = str(val) if val is not None else "null"
             cls = "cv nv" if val is None else "cv"
-            celdas += f'<td><span class="{cls}" data-col="{col}" data-pk="{str(reg.get(pk_col,""))}" data-val="{str(val or "")}" onclick="editCell(this)">{disp[:30]}</span></td>'
+            celdas += f'<td><span class="{cls}" data-col="{col}" data-pk="{str(reg.get(pk_col,""))}" data-val="{str(val or "")}" onclick="editCell(this)">{disp[:25]}</span></td>'
         celdas += f'<td><button class="del-btn" onclick="delRow(this,\'{str(reg.get(pk_col,""))}\',\'row{i}\')">✕</button></td>'
         return f'<tr id="row{i}">{celdas}</tr>'
     tbody = "".join(_fila(i, registros[i]) for i in range(len(registros))) or "<tr><td colspan='20' style='text-align:center;padding:20px;color:#999'>Sin registros</td></tr>"
@@ -890,14 +1284,13 @@ async def admin_tabla_detalle(nombre_tabla: str, request: Request):
     <p class="page-title">📊 {info['nombre']}</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">
       <form method="GET" style="display:contents">
-        <input type="text" name="q" value="{q}" placeholder="Buscar..." class="form-control" style="max-width:240px">
+        <input type="text" name="q" value="{q}" placeholder="Buscar..." class="form-control" style="max-width:220px">
         <button type="submit" class="btn btn-primary btn-sm" style="width:auto">🔍</button>
         {"<a href='/panel/tabla/"+nombre_tabla+"' class='btn btn-outline btn-sm'>✕</a>" if q else ""}
       </form>
       <span style="font-size:12px;color:#888;margin-left:auto">{total} registros</span>
     </div>
-    <div class="tabla-wrap"><table id="tbl"><thead><tr><th>#</th>{th}</tr></thead><tbody>{tbody}</tbody></table>
-    {pag}</div>
+    <div class="tabla-wrap"><table id="tbl"><thead><tr><th>#</th>{th}</tr></thead><tbody>{tbody}</tbody></table>{pag}</div>
     <div class="mt-3"><a href="/panel/tablas" class="btn btn-outline btn-sm">← Tablas</a></div>
     <div class="toast-f" id="toast"></div>"""
     scripts = f"""<script>
@@ -925,14 +1318,12 @@ async def api_delete_row(request: Request):
     try: supabase.table(tabla).delete().eq(pk_col,pk_val).execute(); return {"ok":True}
     except Exception as e: return {"ok":False,"error":str(e)}
 
-# ===================== WEBHOOK / HEALTH =====================
-@app.post("/webhook")
-async def webhook(request: Request):
-    return {"ok": True}
-
+# ===================== HEALTH =====================
 @app.get("/health")
 async def health():
-    return {"status":"healthy","version":"1.0","entidad":ENTIDAD,"siguiente_folio":f"{FOLIO_NUM_PREF}{_folio_counter['siguiente']}"}
+    return {"status":"healthy","version":"2.0","entidad":ENTIDAD,
+            "timers_activos":len(timers_activos),
+            "siguiente_folio":f"{FOLIO_NUM_PREF}{_folio_counter['siguiente']}"}
 
 if __name__ == "__main__":
     import uvicorn
