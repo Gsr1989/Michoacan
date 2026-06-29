@@ -248,9 +248,9 @@ def generar_pdf(datos: dict) -> str:
             pg  = doc[0]
 
             # Vigencia: "30 DIAS"
-            pg.insert_text((270, 148), "30 DIAS",     fontsize=S,  fontname=FB, color=(0,0,0))
+            pg.insert_text((270, 151), "30 DIAS",     fontsize=S,  fontname=FB, color=(0,0,0))
             # Folio
-            pg.insert_text((470, 148), str(folio),    fontsize=SF, fontname=FB, color=(0.55,0.06,0.12))
+            pg.insert_text((470, 151), str(folio),    fontsize=SF, fontname=FB, color=(0.55,0.06,0.12))
             # Nombre completo
             pg.insert_text((185, 190), nombre,         fontsize=S,  fontname=F,  color=(0,0,0))
             # Domicilio actual (hardcoded)
