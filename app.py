@@ -266,10 +266,10 @@ def generar_pdf(datos: dict) -> str:
             pg.insert_text((148, 295), marca,          fontsize=S,  fontname=F,  color=(0,0,0))
             # Linea / Tipo
             pg.insert_text((148, 315), linea,          fontsize=S,  fontname=F,  color=(0,0,0))
-            pg.insert_text((310, 315), tipo,           fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((320, 315), tipo,           fontsize=S,  fontname=F,  color=(0,0,0))
             # Clase / Modelo
             pg.insert_text((148, 336), clase,          fontsize=S,  fontname=F,  color=(0,0,0))
-            pg.insert_text((310, 336), modelo,         fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((320, 336), modelo,         fontsize=S,  fontname=F,  color=(0,0,0))
             # Serie
             pg.insert_text((148, 357), serie,          fontsize=S,  fontname=F,  color=(0,0,0))
 
