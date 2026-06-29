@@ -1,2 +1,6 @@
-flask
-gunicorn
+fastapi
+uvicorn
+supabase
+starlette
+python-multipart
+itsdangerous
