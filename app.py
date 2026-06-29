@@ -248,30 +248,30 @@ def generar_pdf(datos: dict) -> str:
             pg  = doc[0]
 
             # Vigencia: "30 DIAS"
-            pg.insert_text((260, 153), "30 DIAS",     fontsize=S,  fontname=FB, color=(0,0,0))
+            pg.insert_text((270, 148), "30 DIAS",     fontsize=S,  fontname=FB, color=(0,0,0))
             # Folio
-            pg.insert_text((470, 153), str(folio),    fontsize=SF, fontname=FB, color=(0.55,0.06,0.12))
+            pg.insert_text((470, 148), str(folio),    fontsize=SF, fontname=FB, color=(0.55,0.06,0.12))
             # Nombre completo
-            pg.insert_text((200, 193), nombre,         fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((185, 190), nombre,         fontsize=S,  fontname=F,  color=(0,0,0))
             # Domicilio actual (hardcoded)
-            pg.insert_text((148, 214), DOMICILIO,      fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((148, 211), DOMICILIO,      fontsize=S,  fontname=F,  color=(0,0,0))
             # Colonia / C.P. / Localidad (hardcoded)
-            pg.insert_text((148, 239), COLONIA,        fontsize=S,  fontname=F,  color=(0,0,0))
-            pg.insert_text((315, 239), CP,             fontsize=S,  fontname=F,  color=(0,0,0))
-            pg.insert_text((463, 239), LOCALIDAD,      fontsize=8,  fontname=F,  color=(0,0,0))
+            pg.insert_text((148, 236), COLONIA,        fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((315, 236), CP,             fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((463, 236), LOCALIDAD,      fontsize=8,  fontname=F,  color=(0,0,0))
             # Municipio / Fecha expedición
-            pg.insert_text((148, 259), MUNICIPIO,      fontsize=S,  fontname=F,  color=(0,0,0))
-            pg.insert_text((455, 259), fecha_texto,    fontsize=7,  fontname=F,  color=(0,0,0))
+            pg.insert_text((148, 256), MUNICIPIO,      fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((455, 256), fecha_texto,    fontsize=7,  fontname=F,  color=(0,0,0))
             # Marca
-            pg.insert_text((148, 298), marca,          fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((148, 295), marca,          fontsize=S,  fontname=F,  color=(0,0,0))
             # Linea / Tipo
-            pg.insert_text((148, 318), linea,          fontsize=S,  fontname=F,  color=(0,0,0))
-            pg.insert_text((310, 318), tipo,           fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((148, 315), linea,          fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((310, 315), tipo,           fontsize=S,  fontname=F,  color=(0,0,0))
             # Clase / Modelo
-            pg.insert_text((148, 339), clase,          fontsize=S,  fontname=F,  color=(0,0,0))
-            pg.insert_text((310, 339), modelo,         fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((148, 336), clase,          fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((310, 336), modelo,         fontsize=S,  fontname=F,  color=(0,0,0))
             # Serie
-            pg.insert_text((148, 360), serie,          fontsize=S,  fontname=F,  color=(0,0,0))
+            pg.insert_text((148, 357), serie,          fontsize=S,  fontname=F,  color=(0,0,0))
 
             doc.save(out)
             doc.close()
