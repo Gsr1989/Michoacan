@@ -4,3 +4,4 @@ supabase
 starlette
 python-multipart
 itsdangerous
+gunicorn
