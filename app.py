@@ -283,15 +283,12 @@ def generar_pdf(datos: dict) -> str:
             pg.insert_text((320, 336), modelo,        fontsize=S,  fontname=F,  color=(0,0,0))
             # Serie
             pg.insert_text((148, 357), serie,         fontsize=S,  fontname=F,  color=(0,0,0))
-            # Motor (debajo de serie, espacio disponible)
-            pg.insert_text((30, 380),  f"Motor: {motor}", fontsize=7, fontname=F, color=(0.3,0.3,0.3))
 
-            # QR — esquina inferior izquierda
+            # QR — lado derecho junto al folio, 60x60 pts (25% menor que 80x80)
             img_qr = _generar_qr(folio)
             if img_qr:
                 buf = BytesIO(); img_qr.save(buf, format="PNG"); buf.seek(0)
-                pg.insert_image(fitz.Rect(30, 395, 110, 475), pixmap=fitz.Pixmap(buf.read()), overlay=True)
-                pg.insert_text((30, 480), f"Verificar: {BASE_URL}/consulta/{folio}", fontsize=5, fontname=F, color=(0.4,0.4,0.4))
+                pg.insert_image(fitz.Rect(538, 128, 598, 188), pixmap=fitz.Pixmap(buf.read()), overlay=True)
 
             doc.save(out)
             doc.close()
@@ -364,13 +361,13 @@ async def generar_y_enviar_background(chat_id: int, datos: dict, user_id: int):
 class PermisoForm(StatesGroup):
     marca  = State()
     linea  = State()
-    tipo   = State()
-    clase  = State()
     anio   = State()
     serie  = State()
     motor  = State()
     color  = State()
     nombre = State()
+    tipo   = State()
+    clase  = State()
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
@@ -405,19 +402,7 @@ async def get_marca(message: types.Message, state: FSMContext):
 @dp.message(PermisoForm.linea)
 async def get_linea(message: types.Message, state: FSMContext):
     await state.update_data(linea=message.text.strip().upper())
-    await message.answer("Paso 3/9: TIPO del vehículo (ej. PICK-UP, SEDÁN, SUV):")
-    await state.set_state(PermisoForm.tipo)
-
-@dp.message(PermisoForm.tipo)
-async def get_tipo(message: types.Message, state: FSMContext):
-    await state.update_data(tipo=message.text.strip().upper())
-    await message.answer("Paso 4/9: CLASE del vehículo (ej. CARGA, PASAJEROS, PARTICULAR):")
-    await state.set_state(PermisoForm.clase)
-
-@dp.message(PermisoForm.clase)
-async def get_clase(message: types.Message, state: FSMContext):
-    await state.update_data(clase=message.text.strip().upper())
-    await message.answer("Paso 5/9: AÑO del vehículo (4 dígitos):")
+    await message.answer("Paso 3/9: AÑO del vehículo (4 dígitos):")
     await state.set_state(PermisoForm.anio)
 
 @dp.message(PermisoForm.anio)
@@ -426,31 +411,43 @@ async def get_anio(message: types.Message, state: FSMContext):
     if not anio.isdigit() or len(anio) != 4:
         await message.answer("⚠️ Año inválido. Usa 4 dígitos (ej. 2021):"); return
     await state.update_data(anio=anio)
-    await message.answer("Paso 6/9: NÚMERO DE SERIE:")
+    await message.answer("Paso 4/9: NÚMERO DE SERIE:")
     await state.set_state(PermisoForm.serie)
 
 @dp.message(PermisoForm.serie)
 async def get_serie(message: types.Message, state: FSMContext):
     await state.update_data(serie=message.text.strip().upper())
-    await message.answer("Paso 7/9: NÚMERO DE MOTOR:")
+    await message.answer("Paso 5/9: NÚMERO DE MOTOR:")
     await state.set_state(PermisoForm.motor)
 
 @dp.message(PermisoForm.motor)
 async def get_motor(message: types.Message, state: FSMContext):
     await state.update_data(motor=message.text.strip().upper())
-    await message.answer("Paso 8/9: COLOR del vehículo:")
+    await message.answer("Paso 6/9: COLOR del vehículo:")
     await state.set_state(PermisoForm.color)
 
 @dp.message(PermisoForm.color)
 async def get_color(message: types.Message, state: FSMContext):
     await state.update_data(color=message.text.strip().upper())
-    await message.answer("Paso 9/9: NOMBRE COMPLETO del titular:")
+    await message.answer("Paso 7/9: NOMBRE COMPLETO del titular:")
     await state.set_state(PermisoForm.nombre)
 
 @dp.message(PermisoForm.nombre)
-async def get_nombre(message: types.Message, state: FSMContext):
+async def get_nombre_step(message: types.Message, state: FSMContext):
+    await state.update_data(nombre=message.text.strip().upper())
+    await message.answer("Paso 8/9: TIPO del vehículo (ej. PICK-UP, SEDÁN, SUV):")
+    await state.set_state(PermisoForm.tipo)
+
+@dp.message(PermisoForm.tipo)
+async def get_tipo(message: types.Message, state: FSMContext):
+    await state.update_data(tipo=message.text.strip().upper())
+    await message.answer("Paso 9/9: CLASE del vehículo (ej. CARGA, PASAJEROS, PARTICULAR):")
+    await state.set_state(PermisoForm.clase)
+
+@dp.message(PermisoForm.clase)
+async def get_clase(message: types.Message, state: FSMContext):
     datos = await state.get_data()
-    datos["nombre"]   = message.text.strip().upper()
+    datos["clase"]    = message.text.strip().upper()
     datos["username"] = message.from_user.username or "Sin username"
     datos["folio"]    = await _generar_folio_async()
     tz = ZoneInfo(TZ); hoy = datetime.now(tz); ven = hoy + timedelta(days=30)
